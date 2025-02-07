@@ -1,0 +1,33 @@
+server:
+  port: 8081
+
+spring:
+  kafka:
+    bootstrap-servers: "localhost:9092"
+    consumer:
+      group-id: "parser-group"
+      auto-offset-reset: earliest
+
+kafka:
+  topics:
+    parser-topic: "parser-topic"   # This is the topic where the file path is sent
+
+elasticsearch:
+  host: "localhost"
+  port: 9200
+  index: "findings-index"  # or any name you prefer
+
+# Optional example: mapping severities
+severity.map:
+  critical: [critical, severe]
+  high: [high, important]
+  medium: [medium, moderate]
+  low: [low, minor]
+  informational: [info, informational, notice]
+
+state.map:
+  open: [open, new]
+  "false positive": [false_positive, unlikely]
+  suppressed: [suppressed, ignored]
+  fixed: [fixed, resolved]
+  confirm: [confirm, acknowledged]
