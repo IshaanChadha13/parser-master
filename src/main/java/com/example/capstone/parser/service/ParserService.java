@@ -3,6 +3,7 @@ package com.example.capstone.parser.service;
 import com.example.capstone.parser.model.AlertState;
 import com.example.capstone.parser.model.Findings;
 import com.example.capstone.parser.model.Severity;
+import com.example.capstone.parser.producer.AcknowledgementProducer;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Service;
@@ -11,151 +12,131 @@ import java.io.File;
 import java.util.*;
 import java.util.regex.Pattern;
 
-
 @Service
 public class ParserService {
 
     private final ElasticsearchClientService esService;
     private final ObjectMapper mapper;
+    private final AcknowledgementProducer acknowledgementProducer; // New field
 
-    public ParserService(ElasticsearchClientService esService) {
+    public ParserService(ElasticsearchClientService esService, AcknowledgementProducer acknowledgementProducer) {
         this.esService = esService;
+        this.acknowledgementProducer = acknowledgementProducer;
         this.mapper = new ObjectMapper();
     }
 
-    public void parseFileAndIndex(String filePath) {
+    /**
+     * Parses the file and indexes the alerts.
+     *
+     * @param tenantId the tenant identifier
+     * @param filePath the path to the alerts file
+     * @param toolType the type of tool (e.g., CODE_SCANNING, DEPENDABOT, SECRET_SCANNING)
+     * @param eventId  the original eventId for this parse job (to be used in the ack)
+     */
+    public void parseFileAndIndex(Long tenantId, String filePath, String toolType, String eventId) {
+        boolean success = false;
         try {
-            // 1) read as array of alerts
-            List<Map<String,Object>> rawAlerts = mapper.readValue(
+            // 1) Read raw alerts from file
+            List<Map<String, Object>> rawAlerts = mapper.readValue(
                     new File(filePath),
-                    new TypeReference<List<Map<String,Object>>>() {}
+                    new TypeReference<>() {}
             );
 
-            // 2) deduce tool type
-            String toolType = deduceToolType(filePath);
+            // 2) Optionally parse owner/repo from folder name
+            String[] ownerRepo = parseOwnerRepoFromPath(filePath);
+            String parsedOwner = ownerRepo[0];
+            String parsedRepo  = ownerRepo[1];
 
-            System.out.println("Parsing " + rawAlerts.size()
-                    + " alerts for tool " + toolType);
+            System.out.println("ParserService => Found " + rawAlerts.size()
+                    + " alerts for tool " + toolType
+                    + " in tenant " + tenantId
+                    + " => (" + parsedOwner + "/" + parsedRepo + ")");
 
-            // optionally parse owner/repo
-            String[] or = parseOwnerRepoFromPath(filePath);
-            String parsedOwner = or[0];
-            String parsedRepo = or[1];
-
-            // 3) for each raw alert => convert => deduplicate
-            for (Map<String,Object> alert : rawAlerts) {
+            // 3) Convert, deduplicate, and store each alert
+            for (Map<String, Object> alert : rawAlerts) {
                 Findings f = convertToFindings(toolType, alert);
 
-                // store owner/repo in additionalData if you want
-                Map<String,Object> addData = f.getAdditionalData() != null
+                // Include tenantId, owner, repo in additionalData
+                Map<String, Object> addData = (f.getAdditionalData() != null)
                         ? f.getAdditionalData()
                         : new HashMap<>();
+                addData.put("tenantId", tenantId);
                 addData.put("owner", parsedOwner);
                 addData.put("repo", parsedRepo);
                 f.setAdditionalData(addData);
 
-                // run deduplicate logic
-                deduplicateAndStore(f);
+                // Deduplicate & store
+                deduplicateAndStore(tenantId, f);
             }
+            success = true;
         } catch (Exception e) {
             e.printStackTrace();
+        } finally {
+
+            try {
+                Thread.sleep(10000);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+
+            acknowledgementProducer.sendParseAcknowledgement(eventId, success);
         }
     }
 
-    /**
-     * deduplicateAndStore:
-     *   1) fetch all existing docs for same toolType
-     *   2) for each existing doc, compare composite-key hash
-     *      if match => compare updatable hash => skip or update
-     *   3) if no existing doc matches => index new
-     *
-     * This method does NOT store composite key or hash in ES.
-     * Everything is computed on the fly.
-     */
-    private void deduplicateAndStore(Findings newDoc) {
-        // compute newDoc's compositeKey hash
+    private void deduplicateAndStore(Long tenantId, Findings newDoc) {
         String newCompositeHash = computeCompositeKeyHash(newDoc);
 
-        // fetch all existing docs for the same tool type
-        List<Findings> existingDocs = esService.findAllByToolType(newDoc.getToolType());
+        // fetch existing docs for the same tenant + tool type
+        List<Findings> existingDocs = esService.findAllByTenantAndToolType(tenantId, newDoc.getToolType());
 
         for (Findings oldDoc : existingDocs) {
             String oldCompositeHash = computeCompositeKeyHash(oldDoc);
             if (Objects.equals(oldCompositeHash, newCompositeHash)) {
-                // composite match => check updatable fields
                 String newUpdatableHash = computeUpdatableHash(newDoc);
                 String oldUpdatableHash = computeUpdatableHash(oldDoc);
 
                 if (Objects.equals(newUpdatableHash, oldUpdatableHash)) {
-                    // exact duplicate => skip
                     System.out.println("Skipping duplicate => " + newCompositeHash);
-                    return; // done
+                    return;
                 } else {
-                    // updated => preserve old doc's ID
                     newDoc.setId(oldDoc.getId());
-                    // we might want to override 'updatedAt' to now, if you want
-                    // or rely on the newDoc's updatedAt from GH
-                    esService.updateFindings(newDoc);
+                    esService.updateFindings(tenantId, newDoc);
                     System.out.println("Updated => " + newCompositeHash);
-                    return; // done
+                    return;
                 }
             }
         }
 
-        // if we get here => no match => new doc
         newDoc.setId(UUID.randomUUID().toString());
-        esService.indexFindings(newDoc);
+        esService.indexFindings(tenantId, newDoc);
         System.out.println("Indexed new doc => " + newCompositeHash);
     }
 
-    /**
-     * Composite key = "alertNumber + title"
-     * We do NOT store or index it. We compute on the fly for new & old docs.
-     */
     private String computeCompositeKeyHash(Findings f) {
-        // e.g. f.getAlertNumber() + f.getTitle()
         String composite = (f.getAlertNumber() != null ? f.getAlertNumber() : "")
                 + "||"
                 + (f.getTitle() != null ? f.getTitle() : "");
-        // hash it
         return String.valueOf(composite.hashCode());
     }
 
-    /**
-     * Updatable fields => severity, state, updatedAt, etc.
-     * Possibly also tool-specific logic
-     */
     private String computeUpdatableHash(Findings f) {
         StringBuilder sb = new StringBuilder();
-        // minimal example
         if (f.getSeverity() != null) sb.append(f.getSeverity()).append("|");
         if (f.getState() != null) sb.append(f.getState()).append("|");
         if (f.getUpdatedAt() != null) sb.append(f.getUpdatedAt());
-
-        // you can do tool-specific
-        // e.g. if CODE_SCANNING => ...
-        // if DEPENDABOT => ...
         return String.valueOf(sb.toString().hashCode());
     }
 
-    private String deduceToolType(String filePath) {
-        String lower = filePath.toLowerCase();
-        if (lower.contains("code_scanning")) {
-            return "CODE_SCANNING";
-        } else if (lower.contains("dependabot")) {
-            return "DEPENDABOT";
-        } else if (lower.contains("secret_scanning")) {
-            return "SECRET_SCANNING";
-        }
-        return "UNKNOWN_TOOL";
-    }
+    // ----------------------------------------------------------------------
+    // Tool-specific conversion methods
+    // ----------------------------------------------------------------------
 
-    private Findings convertToFindings(String toolType, Map<String,Object> alert) {
+    private Findings convertToFindings(String toolType, Map<String, Object> alert) {
         Findings f = new Findings();
         f.setId(UUID.randomUUID().toString());
         f.setToolType(toolType);
+        f.setTicketId(null);
 
-        // e.g. read 'number'
         Object numberObj = alert.get("number");
         String alertNum = (numberObj != null) ? numberObj.toString() : "";
         f.setAlertNumber(alertNum);
@@ -164,15 +145,8 @@ public class ParserService {
         f.setUpdatedAt(safeString(alert.get("updated_at")));
         f.setUrl(safeString(alert.get("html_url")));
 
-//        String rawState = safeString(alert.get("state"));
-//        f.setState(AlertState.fromRaw(rawState));
-
         String rawState = safeString(alert.get("state"));
-
-        // We also read "dismissed_reason" if present => "false positive", etc.
         String rawDismissedReason = safeString(alert.get("dismissed_reason"));
-
-        // Now we call the new fromRaw(...) that uses toolType + reason
         AlertState finalState = AlertState.fromRaw(rawState, toolType, rawDismissedReason);
         f.setState(finalState);
 
@@ -198,25 +172,114 @@ public class ParserService {
         return f;
     }
 
-    private void fillCodeScanningData(Findings f, Map<String,Object> alert) {
+    private void fillCodeScanningData(Findings f, Map<String, Object> alert) {
         String rawSeverity = safeString(getNested(alert, "rule", "security_severity_level"));
         if (rawSeverity.isEmpty()) {
             rawSeverity = safeString(getNested(alert, "rule", "severity"));
         }
         f.setSeverity(Severity.fromRaw(rawSeverity));
-
         f.setTitle(safeString(getNested(alert, "rule", "description")));
         f.setDescription(safeString(getNested(alert, "rule", "full_description")));
-
         Object path = getNested(alert, "most_recent_instance", "location", "path");
         f.setLocation(path != null ? path.toString() : "");
-
-        // parse cwe
         Object tagsObj = getNested(alert, "rule", "tags");
         f.setCwe(parseCweFromTags(tagsObj));
-
         f.setCve("");
         f.setCvss("");
+    }
+
+    private void fillDependabotData(Findings f, Map<String, Object> alert) {
+        String rawSeverity = safeString(getNested(alert, "security_advisory", "severity"));
+        f.setSeverity(Severity.fromRaw(rawSeverity));
+        f.setCve(safeString(getNested(alert, "security_advisory", "cve_id")));
+        f.setTitle(safeString(getNested(alert, "security_advisory", "summary")));
+        f.setDescription(safeString(getNested(alert, "security_advisory", "description")));
+        f.setCwe(parseCwe(getNested(alert, "security_advisory", "cwes")));
+        String cvssVal = safeString(getNested(alert, "security_advisory", "cvss", "score"));
+        f.setCvss(cvssVal);
+        String manifest = safeString(getNested(alert, "dependency", "manifest_path"));
+        if (!manifest.isEmpty()) {
+            f.setLocation(manifest);
+        } else {
+            f.setLocation(safeString(getNested(alert, "dependency", "package", "name")));
+        }
+    }
+
+    private void fillSecretScanningData(Findings f, Map<String, Object> alert) {
+        Boolean publiclyLeaked = (alert.get("publicly_leaked") instanceof Boolean)
+                ? (Boolean) alert.get("publicly_leaked")
+                : false;
+        f.setSeverity(Boolean.TRUE.equals(publiclyLeaked) ? Severity.CRITICAL : Severity.HIGH);
+        String secretTypeDisplay = safeString(alert.get("secret_type_display_name"));
+        if (secretTypeDisplay.isEmpty()) {
+            secretTypeDisplay = safeString(alert.get("secret_type"));
+        }
+        f.setTitle("Secret Scanning Alert: " + secretTypeDisplay);
+        String validity = safeString(alert.get("validity"));
+        String resolution = safeString(alert.get("resolution"));
+        boolean pushProtectionBypassed = (alert.get("push_protection_bypassed") instanceof Boolean)
+                ? (boolean) alert.get("push_protection_bypassed")
+                : false;
+        String rawSecret = safeString(alert.get("secret"));
+        String maskedSecret = rawSecret.isEmpty() ? "" : (rawSecret.length() > 8
+                ? rawSecret.substring(0, 8) + "...(masked)"
+                : rawSecret);
+        StringBuilder descBuilder = new StringBuilder();
+        descBuilder.append("Secret Type: ").append(safeString(alert.get("secret_type")))
+                .append("; Validity: ").append(validity)
+                .append("; Publicly Leaked: ").append(publiclyLeaked)
+                .append("; Push Protection Bypassed: ").append(pushProtectionBypassed);
+        if (!resolution.isEmpty()) {
+            descBuilder.append("; Resolution: ").append(resolution);
+        }
+        if (!maskedSecret.isEmpty()) {
+            descBuilder.append("; Secret (masked): ").append(maskedSecret);
+        }
+        f.setDescription(descBuilder.toString());
+        f.setCve("");
+        f.setCwe("");
+        f.setCvss("");
+        f.setLocation(safeString(alert.get("locations_url")));
+    }
+
+    // ----------------------------------------------------------------------
+    // File path logic and misc helpers
+    // ----------------------------------------------------------------------
+
+    private String[] parseOwnerRepoFromPath(String filePath) {
+        File f = new File(filePath);
+        String parent = f.getParent();
+        String[] pathParts = parent.split(Pattern.quote(File.separator));
+        String secondLast = pathParts[pathParts.length - 2];
+        int underscoreIdx = secondLast.indexOf("_");
+        if (underscoreIdx >= 0) {
+            secondLast = secondLast.substring(underscoreIdx + 1);
+        }
+        int lastDash = secondLast.lastIndexOf("-");
+        if (lastDash == -1) {
+            return new String[]{"unknownOwner", "unknownRepo"};
+        }
+        String owner = secondLast.substring(0, lastDash);
+        String repo  = secondLast.substring(lastDash + 1);
+        return new String[]{ owner, repo };
+    }
+
+    private String deduceToolType(String filePath) {
+        String lower = filePath.toLowerCase();
+        if (lower.contains("code_scanning")) return "CODE_SCANNING";
+        if (lower.contains("dependabot")) return "DEPENDABOT";
+        if (lower.contains("secret_scanning")) return "SECRET_SCANNING";
+        return "UNKNOWN_TOOL";
+    }
+
+    private Object getNested(Map<String, Object> map, String... path) {
+        Object current = map;
+        for (String p : path) {
+            if (!(current instanceof Map)) return null;
+            current = ((Map) current).get(p);
+            if (current == null) return null;
+        }
+        return current;
     }
 
     private String parseCweFromTags(Object tagsObj) {
@@ -240,55 +303,13 @@ public class ParserService {
         return "";
     }
 
-    private void fillDependabotData(Findings f, Map<String,Object> alert) {
-        String rawSeverity = safeString(getNested(alert, "security_advisory", "severity"));
-        f.setSeverity(Severity.fromRaw(rawSeverity));
-
-        f.setCve(safeString(getNested(alert, "security_advisory", "cve_id")));
-        f.setTitle(safeString(getNested(alert, "security_advisory", "summary")));
-        f.setDescription(safeString(getNested(alert, "security_advisory", "description")));
-        f.setCwe(parseCwe(getNested(alert, "security_advisory", "cwes")));
-
-        String cvssVal = safeString(getNested(alert, "security_advisory", "cvss", "score"));
-        f.setCvss(cvssVal);
-
-        String manifest = safeString(getNested(alert, "dependency", "manifest_path"));
-        if (!manifest.isEmpty()) {
-            f.setLocation(manifest);
-        } else {
-            f.setLocation(safeString(getNested(alert, "dependency", "package", "name")));
-        }
-    }
-
-    private void fillSecretScanningData(Findings f, Map<String,Object> alert) {
-        f.setSeverity(Severity.HIGH);
-        f.setTitle("Secret Scanning Alert");
-        f.setDescription("");
-        f.setCve("");
-        f.setCwe("");
-        f.setCvss("");
-        f.setLocation("");
-    }
-
-    // Helpers
-
-    private Object getNested(Map<String,Object> map, String... path) {
-        Object current = map;
-        for (String p : path) {
-            if (!(current instanceof Map)) return null;
-            current = ((Map)current).get(p);
-            if (current == null) return null;
-        }
-        return current;
-    }
-
     private String parseCwe(Object cwesObj) {
         if (cwesObj instanceof List) {
             List<?> list = (List<?>) cwesObj;
             if (!list.isEmpty()) {
                 Object first = list.get(0);
                 if (first instanceof Map) {
-                    Object cweId = ((Map)first).get("cwe_id");
+                    Object cweId = ((Map) first).get("cwe_id");
                     return cweId != null ? cweId.toString() : "";
                 }
             }
@@ -299,16 +320,4 @@ public class ParserService {
     private String safeString(Object val) {
         return val != null ? val.toString() : "";
     }
-
-    private String[] parseOwnerRepoFromPath(String filePath) {
-        File f = new File(filePath);
-        String parent = f.getParent();
-        String sepRegex = Pattern.quote(File.separator);
-        String[] parts = parent.split(sepRegex);
-
-        String lastFolder = parts[parts.length - 2];
-        return lastFolder.split("-", 2);
-    }
 }
-
-

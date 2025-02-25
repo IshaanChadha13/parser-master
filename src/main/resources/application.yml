@@ -8,9 +8,24 @@ spring:
       group-id: "parser-group"
       auto-offset-reset: earliest
 
+  datasource:
+    url: "jdbc:mysql://localhost:3306/capstone"
+    username: capstone
+    password: MyCapstonePassword
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+
 kafka:
   topics:
-    parser-topic: "parser-topic"   # This is the topic where the file path is sent
+#    parser-topic: "parser-topic"   # This is the topic where the file path is sent
+#    scan-parse-topic: "scan-parse-topic"
+    jfc-parser-topic: "jfc-parser-topic"
+    job-acknowledgement-topic: "job-acknowledgement-topic"
 
 elasticsearch:
   host: "localhost"

@@ -17,6 +17,7 @@ public class Findings {
     private String cwe;           // optional
     private String cvss;          // optional
     private String location;
+    private String ticketId;
 
     public String getAlertNumber() {
         return alertNumber;
@@ -134,12 +135,19 @@ public class Findings {
         this.location = location;
     }
 
-
     public Map<String, Object> getAdditionalData() {
         return additionalData;
     }
 
     public void setAdditionalData(Map<String, Object> additionalData) {
         this.additionalData = additionalData;
+    }
+
+    public String getTicketId() {
+        return ticketId;
+    }
+
+    public void setTicketId(String ticketId) {
+        this.ticketId = ticketId;
     }
 }
