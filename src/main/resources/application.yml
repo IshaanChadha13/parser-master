@@ -26,6 +26,7 @@ kafka:
 #    scan-parse-topic: "scan-parse-topic"
     jfc-parser-topic: "jfc-parser-topic"
     job-acknowledgement-topic: "job-acknowledgement-topic"
+    jfc-jobs: "jfc-jobs"
 
 elasticsearch:
   host: "localhost"

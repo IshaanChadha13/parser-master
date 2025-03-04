@@ -1,11 +1,15 @@
 package com.example.capstone.parser.service;
 
+import com.example.capstone.parser.dto.NewScanRunbookEvent;
 import com.example.capstone.parser.model.AlertState;
 import com.example.capstone.parser.model.Findings;
+import com.example.capstone.parser.model.NewScanRunbookPayload;
 import com.example.capstone.parser.model.Severity;
 import com.example.capstone.parser.producer.AcknowledgementProducer;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
@@ -15,14 +19,20 @@ import java.util.regex.Pattern;
 @Service
 public class ParserService {
 
+    @Value("${kafka.topics.jfc-jobs}")
+    private String jfcJobsTopic;
+
+    private final KafkaTemplate<String, String> kafkaTemplate;
+
     private final ElasticsearchClientService esService;
     private final ObjectMapper mapper;
     private final AcknowledgementProducer acknowledgementProducer; // New field
 
-    public ParserService(ElasticsearchClientService esService, AcknowledgementProducer acknowledgementProducer) {
+    public ParserService(ElasticsearchClientService esService, AcknowledgementProducer acknowledgementProducer, KafkaTemplate<String, String> kafkaTemplate) {
         this.esService = esService;
         this.acknowledgementProducer = acknowledgementProducer;
         this.mapper = new ObjectMapper();
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     /**
@@ -35,6 +45,7 @@ public class ParserService {
      */
     public void parseFileAndIndex(Long tenantId, String filePath, String toolType, String eventId) {
         boolean success = false;
+        List<String> newlyIndexedIds = new ArrayList<>();
         try {
             // 1) Read raw alerts from file
             List<Map<String, Object>> rawAlerts = mapper.readValue(
@@ -66,24 +77,32 @@ public class ParserService {
                 f.setAdditionalData(addData);
 
                 // Deduplicate & store
-                deduplicateAndStore(tenantId, f);
+                boolean isNew = deduplicateAndStore(tenantId, f);
+                if (isNew) {
+                    newlyIndexedIds.add(f.getId());
+                }
             }
             success = true;
+
         } catch (Exception e) {
             e.printStackTrace();
         } finally {
 
             try {
-                Thread.sleep(10000);
+                Thread.sleep(2000);
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
             }
 
             acknowledgementProducer.sendParseAcknowledgement(eventId, success);
+
+            if (success && !newlyIndexedIds.isEmpty()) {
+                emitNewScanEvent(tenantId, toolType, newlyIndexedIds);
+            }
         }
     }
 
-    private void deduplicateAndStore(Long tenantId, Findings newDoc) {
+    private boolean deduplicateAndStore(Long tenantId, Findings newDoc) {
         String newCompositeHash = computeCompositeKeyHash(newDoc);
 
         // fetch existing docs for the same tenant + tool type
@@ -97,12 +116,12 @@ public class ParserService {
 
                 if (Objects.equals(newUpdatableHash, oldUpdatableHash)) {
                     System.out.println("Skipping duplicate => " + newCompositeHash);
-                    return;
+                    return false;
                 } else {
                     newDoc.setId(oldDoc.getId());
                     esService.updateFindings(tenantId, newDoc);
                     System.out.println("Updated => " + newCompositeHash);
-                    return;
+                    return false;
                 }
             }
         }
@@ -110,6 +129,7 @@ public class ParserService {
         newDoc.setId(UUID.randomUUID().toString());
         esService.indexFindings(tenantId, newDoc);
         System.out.println("Indexed new doc => " + newCompositeHash);
+        return true;
     }
 
     private String computeCompositeKeyHash(Findings f) {
@@ -125,6 +145,23 @@ public class ParserService {
         if (f.getState() != null) sb.append(f.getState()).append("|");
         if (f.getUpdatedAt() != null) sb.append(f.getUpdatedAt());
         return String.valueOf(sb.toString().hashCode());
+    }
+
+    private void emitNewScanEvent(Long tenantId, String toolType, List<String> newFindingIds) {
+        try {
+            // Build a payload object
+            NewScanRunbookPayload payload = new NewScanRunbookPayload(tenantId, toolType, newFindingIds);
+            // Build the event
+            NewScanRunbookEvent event = new NewScanRunbookEvent(payload, "jfc-bg-job-topic");
+
+            // Convert to JSON and send
+            String json = mapper.writeValueAsString(event);
+            kafkaTemplate.send(jfcJobsTopic, json);
+
+            System.out.println("[ParserService] Emitted NEW_SCAN runbook event => " + json);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     // ----------------------------------------------------------------------
